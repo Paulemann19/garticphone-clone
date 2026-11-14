@@ -107,16 +107,22 @@ function avatar(name) {
 const isHost = () => S.view && S.view.hostId === S.view.me;
 
 // ---------- Zeichnen: gemeinsamer Code ----------
+// Eine Zeichnung ist eine Liste von Operationen:
+//   Stift/Radierer {c,w,p:[x,y,...]} · Füllen {t:'fill',c,x,y} · Form {t:'shape',k,c,w,f,a:[x1,y1,x2,y2]}
+// Beim Abspielen werden sie in derselben Reihenfolge ausgeführt, dadurch sieht die Animation exakt wie das Original aus.
 
-function buildSegs(strokes) {
-  const segs = [];
-  for (const s of strokes) {
-    const p = s.p;
-    if (p.length < 2) continue;
-    if (p.length === 2) segs.push([s.c, s.w, p[0], p[1], p[0], p[1]]);
-    for (let i = 2; i + 1 < p.length; i += 2) segs.push([s.c, s.w, p[i - 2], p[i - 1], p[i], p[i + 1]]);
+const SHAPES = ['line', 'rect', 'ellipse', 'triangle'];
+
+function buildSteps(ops) {
+  const steps = [];
+  for (const o of ops) {
+    if (o.t === 'fill' || o.t === 'shape') { steps.push(o); continue; }
+    const p = o.p;
+    if (!p || p.length < 2) continue;
+    if (p.length === 2) steps.push([o.c, o.w, p[0], p[1], p[0], p[1]]);
+    for (let i = 2; i + 1 < p.length; i += 2) steps.push([o.c, o.w, p[i - 2], p[i - 1], p[i], p[i + 1]]);
   }
-  return segs;
+  return steps;
 }
 function drawSeg(ctx, g) {
   ctx.strokeStyle = g[0];
@@ -134,6 +140,84 @@ function drawSeg(ctx, g) {
     ctx.stroke();
   }
 }
+function drawShape(ctx, s) {
+  const [x1, y1, x2, y2] = s.a;
+  ctx.strokeStyle = s.c;
+  ctx.fillStyle = s.c;
+  ctx.lineWidth = s.w;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  if (s.k === 'line') {
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+  } else if (s.k === 'rect') {
+    ctx.rect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+  } else if (s.k === 'ellipse') {
+    ctx.ellipse((x1 + x2) / 2, (y1 + y2) / 2, Math.max(1, Math.abs(x2 - x1) / 2), Math.max(1, Math.abs(y2 - y1) / 2), 0, 0, Math.PI * 2);
+  } else if (s.k === 'triangle') {
+    ctx.moveTo((x1 + x2) / 2, y1);
+    ctx.lineTo(x2, y2);
+    ctx.lineTo(x1, y2);
+    ctx.closePath();
+  }
+  if (s.f && s.k !== 'line') ctx.fill();
+  else ctx.stroke();
+}
+function hexRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+// Flächen füllen (Scanline-Flood-Fill mit Toleranz, damit auch die weichen Ränder der Striche mitgefüllt werden).
+// Gibt false zurück, wenn sich nichts geändert hat.
+function floodFill(ctx, sx, sy, hex) {
+  sx = Math.max(0, Math.min(W - 1, sx | 0));
+  sy = Math.max(0, Math.min(H - 1, sy | 0));
+  const img = ctx.getImageData(0, 0, W, H);
+  const d = img.data;
+  const i0 = (sy * W + sx) * 4;
+  const tr = d[i0], tg = d[i0 + 1], tb = d[i0 + 2];
+  const [fr, fg, fb] = hexRgb(hex);
+  if (Math.abs(tr - fr) + Math.abs(tg - fg) + Math.abs(tb - fb) < 12) return false;
+  const TOL = 150;
+  const seen = new Uint8Array(W * H);
+  const ok = (p) => { const i = p * 4; return Math.abs(d[i] - tr) + Math.abs(d[i + 1] - tg) + Math.abs(d[i + 2] - tb) <= TOL; };
+  const stack = [[sx, sy]];
+  let count = 0;
+  while (stack.length) {
+    const [x0, y] = stack.pop();
+    let x = x0;
+    let p = y * W + x;
+    if (seen[p] || !ok(p)) continue;
+    while (x > 0 && !seen[p - 1] && ok(p - 1)) { x--; p--; }
+    let up = false, down = false;
+    while (x < W && !seen[p] && ok(p)) {
+      seen[p] = 1;
+      const i = p * 4;
+      d[i] = fr; d[i + 1] = fg; d[i + 2] = fb; d[i + 3] = 255;
+      count++;
+      if (y > 0) {
+        const o = p - W;
+        const m = !seen[o] && ok(o);
+        if (m && !up) { stack.push([x, y - 1]); up = true; } else if (!m) up = false;
+      }
+      if (y < H - 1) {
+        const o = p + W;
+        const m = !seen[o] && ok(o);
+        if (m && !down) { stack.push([x, y + 1]); down = true; } else if (!m) down = false;
+      }
+      x++; p++;
+    }
+  }
+  if (!count) return false;
+  ctx.putImageData(img, 0, 0);
+  return true;
+}
+function runStep(ctx, st) {
+  if (Array.isArray(st)) drawSeg(ctx, st);
+  else if (st.t === 'fill') floodFill(ctx, st.x, st.y, st.c);
+  else drawShape(ctx, st);
+}
 function whiteout(ctx) {
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, W, H);
@@ -143,18 +227,20 @@ function makeCanvas(cls) {
   whiteout(c.getContext('2d'));
   return c;
 }
-function drawStatic(canvas, strokes) {
+function drawStatic(canvas, ops) {
   const ctx = canvas.getContext('2d');
   whiteout(ctx);
-  for (const g of buildSegs(strokes)) drawSeg(ctx, g);
+  for (const st of buildSteps(ops)) runStep(ctx, st);
 }
-// Spielt eine Zeichnung Strich für Strich ab. Gibt eine Abbruch-Funktion zurück.
-function animateStrokes(canvas, strokes, onDone) {
+// Spielt eine Zeichnung ab. Die ersten `from` Operationen (das übernommene Vorgängerbild) stehen sofort da,
+// der Rest wird Schritt für Schritt gezeichnet. Gibt eine Abbruch-Funktion zurück.
+function animateStrokes(canvas, ops, from, onDone) {
   const ctx = canvas.getContext('2d');
   whiteout(ctx);
-  const segs = buildSegs(strokes);
-  if (!segs.length) { onDone && later(onDone, 600); return () => {}; }
-  const duration = Math.min(10000, Math.max(2500, segs.length * 7));
+  for (const st of buildSteps(ops.slice(0, from))) runStep(ctx, st);
+  const steps = buildSteps(ops.slice(from));
+  if (!steps.length) { onDone && later(onDone, 900); return () => {}; }
+  const duration = Math.min(10000, Math.max(2500, steps.length * 7));
   const start = performance.now();
   let drawn = 0;
   let raf = 0;
@@ -162,18 +248,40 @@ function animateStrokes(canvas, strokes, onDone) {
   const tick = (now) => {
     if (stopped) return;
     const p = Math.min(1, (now - start) / duration);
-    // leichtes Ease-in/out, damit es lebendiger wirkt
-    const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-    const target = Math.floor(eased * segs.length);
-    while (drawn < target) drawSeg(ctx, segs[drawn++]);
+    const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2; // Ease-in/out
+    const target = Math.floor(eased * steps.length);
+    while (drawn < target) runStep(ctx, steps[drawn++]);
     if (p < 1) raf = requestAnimationFrame(tick);
     else {
-      while (drawn < segs.length) drawSeg(ctx, segs[drawn++]);
+      while (drawn < steps.length) runStep(ctx, steps[drawn++]);
       onDone && onDone();
     }
   };
   raf = requestAnimationFrame(tick);
   return () => { stopped = true; cancelAnimationFrame(raf); };
+}
+
+// Mini-Film: blättert die Bilder einer Kette in Endlosschleife durch.
+function makeFlipbook(entries) {
+  const canvas = makeCanvas('rcanvas');
+  const ctx = canvas.getContext('2d');
+  const frames = entries.map((e) => {
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    drawStatic(c, e.strokes);
+    return c;
+  });
+  let i = 0;
+  const show = () => ctx.drawImage(frames[i], 0, 0);
+  return {
+    el: canvas,
+    start() {
+      show();
+      if (frames.length < 2) return;
+      const t = setInterval(() => { i = (i + 1) % frames.length; show(); }, 700);
+      S.timers.add(t);
+    },
+  };
 }
 
 function typewriter(el, text, onDone) {
@@ -321,6 +429,13 @@ function renderLobby() {
   };
 
   const enough = v.players.length >= 3;
+  const anim = v.settings.mode === 'animation';
+  const modeCard = (m, title, desc) =>
+    h('button', {
+      class: 'modecard' + (v.settings.mode === m ? ' sel' : ''),
+      disabled: !host,
+      onclick: () => act('settings', { settings: { mode: m } }).catch((e) => toast(e.message)),
+    }, h('strong', {}, title), h('span', {}, desc));
   setView(
     h('div', { class: 'card center' },
       h('p', { class: 'muted' }, 'Raumcode'),
@@ -332,11 +447,17 @@ function renderLobby() {
       h('div', { class: 'players' },
         v.players.map((p) => h('div', { class: 'chip' + (p.connected ? '' : ' off') }, avatar(p.name), p.name + (p.host ? ' 👑' : '') + (p.id === v.me ? ' (du)' : ''))))),
     h('div', { class: 'card' },
+      h('h3', {}, 'Spielmodus'),
+      h('div', { class: 'modes' },
+        modeCard('normal', '🎨 Normal', 'Schreiben → Zeichnen → Beschreiben → Zeichnen …'),
+        modeCard('animation', '🎞️ Animation', 'Eine Idee, dann zeichnet ihr reihum das nächste Bild. Das Bild des Vorgängers bleibt stehen (oder wird gelöscht). Am Ende läuft jede Kette als Mini-Film.')),
+      !host && h('p', { class: 'muted', style: 'margin-top:10px' }, 'Den Modus wählt der Host.')),
+    h('div', { class: 'card' },
       h('h3', {}, 'Zeit pro Runde'),
       h('div', { class: 'settings' },
-        setting('firstTime', '✍️ Satz schreiben', [30, 45, 60, 90, 120]),
-        setting('drawTime', '🎨 Zeichnen', [45, 60, 90, 120, 180]),
-        setting('writeTime', '💬 Beschreiben', [20, 30, 45, 60, 90])),
+        setting('firstTime', anim ? '✍️ Idee schreiben' : '✍️ Satz schreiben', [30, 45, 60, 90, 120]),
+        setting('drawTime', anim ? '🎨 Pro Bild' : '🎨 Zeichnen', [30, 45, 60, 90, 120, 180]),
+        !anim && setting('writeTime', '💬 Beschreiben', [20, 30, 45, 60, 90])),
       !host && h('p', { class: 'muted', style: 'margin-top:10px' }, 'Nur der Host kann die Zeiten ändern.')),
     host
       ? h('div', { class: 'stack center' },
@@ -349,6 +470,7 @@ function renderLobby() {
 // --- Spielrunde ---
 
 const KIND_LABEL = { write: '✍️ Satz schreiben', draw: '🎨 Zeichnen', describe: '💬 Beschreiben' };
+const ANIM_IDEAS = ['Ein Ball hüpft über eine Wiese', 'Eine Blume wächst und blüht', 'Ein Fisch schwimmt vor einem Hai davon', 'Die Sonne geht hinter einem Berg unter', 'Ein Auto fährt durch eine Pfütze', 'Ein Schneemann schmilzt', 'Eine Rakete hebt ab', 'Ein Vogel baut ein Nest'];
 
 function renderPlay() {
   const v = S.view;
@@ -367,7 +489,7 @@ function buildPlay() {
   const tnum = h('span', { class: 'tnum' }, '');
   const count = h('div', { class: 'pcount', id: 'pcount' }, '');
   const head = h('div', { class: 'phead' },
-    h('div', { class: 'ptitle' }, `Runde ${v.round + 1}/${v.total} · ${KIND_LABEL[v.kind]}`),
+    h('div', { class: 'ptitle' }, titleFor(v)),
     count, tnum, timer);
   Object.assign(ui, { bar, timer, tnum, count });
 
@@ -379,20 +501,34 @@ function buildPlay() {
 
   const input = v.input;
 
+  const anim = v.mode === 'animation';
   if (v.kind === 'write') {
-    const ta = h('textarea', { maxlength: 140, placeholder: 'z. B. „Ein Pinguin im Büro“ – etwas Zeichenbares, gern absurd!' });
-    const idea = h('button', { class: 'ghost', onclick: () => { ta.value = IDEAS[Math.floor(Math.random() * IDEAS.length)]; } }, '🎲 Zufällige Idee');
+    const list = anim ? ANIM_IDEAS : IDEAS;
+    const ta = h('textarea', { maxlength: 140, placeholder: anim ? 'z. B. „Ein Ball hüpft über eine Wiese“ – etwas, das sich bewegt oder verändert!' : 'z. B. „Ein Pinguin im Büro“ – etwas Zeichenbares, gern absurd!' });
+    const idea = h('button', { class: 'ghost', onclick: () => { ta.value = list[Math.floor(Math.random() * list.length)]; } }, '🎲 Zufällige Idee');
     body.append(
-      h('div', { class: 'prompt-box' }, h('small', {}, 'Deine Aufgabe'), 'Denk dir einen Satz aus, den jemand zeichnen soll.'),
+      h('div', { class: 'prompt-box' }, h('small', {}, 'Deine Aufgabe'), anim ? 'Denk dir eine Idee für eine Mini-Animation aus. Die anderen zeichnen sie Bild für Bild.' : 'Denk dir einen Satz aus, den jemand zeichnen soll.'),
       ta, h('div', { style: 'margin-top:10px' }, idea));
     ui.getPayload = () => ({ text: ta.value });
     ui.lock = (locked) => { ta.disabled = locked; idea.disabled = locked; };
     later(() => ta.focus(), 50);
   } else if (v.kind === 'draw') {
-    const text = input && !input.missing ? input.text : '(Der Vorgänger hat nichts geschrieben – zeichne etwas Lustiges!)';
-    const board = makeBoard();
-    body.append(h('div', { class: 'prompt-box' }, h('small', {}, 'Zeichne das'), text), board.el);
-    ui.getPayload = () => ({ strokes: board.strokes });
+    let box;
+    let base = [];
+    if (anim) {
+      const idea = (v.idea || '').trim() || '(keine Idee – lass dir etwas einfallen!)';
+      base = v.round >= 2 && input && input.strokes ? input.strokes : [];
+      box = h('div', { class: 'prompt-box' }, h('small', {}, 'Idee der Animation'), idea,
+        h('div', { class: 'hint' }, v.round === 1
+          ? 'Zeichne das erste Bild.'
+          : 'Das Bild deines Vorgängers steht schon da. Zeichne weiter oder lösche es mit „Alles löschen“.'));
+    } else {
+      const text = input && !input.missing ? input.text : '(Der Vorgänger hat nichts geschrieben – zeichne etwas Lustiges!)';
+      box = h('div', { class: 'prompt-box' }, h('small', {}, 'Zeichne das'), text);
+    }
+    const board = makeBoard(base);
+    body.append(box, board.el);
+    ui.getPayload = () => board.getOps();
     ui.lock = (locked) => board.lock(locked);
   } else {
     const shown = makeCanvas('shown');
@@ -424,6 +560,12 @@ function buildPlay() {
   S.timers.add(iv);
 }
 
+function titleFor(v) {
+  if (v.mode === 'animation' && v.kind === 'draw') return `Bild ${v.round}/${v.total - 1} · 🎨 Zeichnen`;
+  const label = v.mode === 'animation' && v.kind === 'write' ? '✍️ Idee schreiben' : KIND_LABEL[v.kind];
+  return `Runde ${v.round + 1}/${v.total} · ${label}`;
+}
+
 function updatePlay() {
   const v = S.view;
   const ui = S.ui;
@@ -453,34 +595,73 @@ async function submitCurrent(auto) {
 
 // --- Zeichenbrett ---
 
-function makeBoard() {
+const TOOLS = [
+  ['pen', '✏️', 'Stift'],
+  ['eraser', '🧽', 'Radierer'],
+  ['fill', '🪣', 'Fläche füllen'],
+  ['line', '╱', 'Linie'],
+  ['rect', '▭', 'Rechteck'],
+  ['ellipse', '◯', 'Kreis / Ellipse'],
+  ['triangle', '△', 'Dreieck'],
+];
+
+// initialOps: das übernommene Vorgängerbild (Animationsmodus), sonst []
+function makeBoard(initialOps) {
   const canvas = h('canvas', { class: 'board', width: W, height: H });
+  const overlay = h('canvas', { class: 'overlay', width: W, height: H }); // Vorschau für Formen
+  const wrap = h('div', { class: 'boardwrap' }, canvas, overlay);
   const ctx = canvas.getContext('2d');
-  whiteout(ctx);
-  const strokes = [];
+  const octx = overlay.getContext('2d');
+
+  let base = initialOps.slice(); // übernommen, kann komplett gelöscht werden
+  let ops = []; // eigene Operationen
+  const history = []; // für „Zurück“ (auch nach „Alles löschen“)
   let cur = null;
+  let tool = 'pen';
   let color = COLORS[0];
   let size = SIZES[1];
-  let eraser = false;
+  let filled = false;
   let locked = false;
 
-  const redraw = () => drawStatic(canvas, strokes);
+  const redraw = () => drawStatic(canvas, base.concat(ops));
+  const remember = () => { history.push({ base, ops: ops.slice() }); if (history.length > 80) history.shift(); };
+  redraw();
+
   const pos = (e) => {
     const r = canvas.getBoundingClientRect();
     return [Math.round(((e.clientX - r.left) * W) / r.width), Math.round(((e.clientY - r.top) * H) / r.height)];
   };
 
   canvas.addEventListener('pointerdown', (e) => {
-    if (locked || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (locked || cur || (e.pointerType === 'mouse' && e.button !== 0)) return;
     e.preventDefault();
-    canvas.setPointerCapture(e.pointerId);
     const [x, y] = pos(e);
-    cur = { c: eraser ? '#ffffff' : color, w: eraser ? size * 1.8 : size, p: [x, y] };
-    strokes.push(cur);
+    if (tool === 'fill') {
+      if (floodFill(ctx, x, y, color)) { remember(); ops.push({ t: 'fill', c: color, x, y }); }
+      return;
+    }
+    canvas.setPointerCapture(e.pointerId);
+    if (SHAPES.includes(tool)) {
+      cur = { t: 'shape', k: tool, c: color, w: size, f: filled && tool !== 'line', a: [x, y, x, y] };
+      return;
+    }
+    remember();
+    const eraser = tool === 'eraser';
+    cur = { c: eraser ? '#ffffff' : color, w: eraser ? Math.round(size * 2.5) : size, p: [x, y] };
+    ops.push(cur);
     drawSeg(ctx, [cur.c, cur.w, x, y, x, y]);
   });
+
   canvas.addEventListener('pointermove', (e) => {
     if (!cur) return;
+    if (cur.t === 'shape') {
+      const [x, y] = pos(e);
+      cur.a[2] = x;
+      cur.a[3] = y;
+      octx.clearRect(0, 0, W, H);
+      drawShape(octx, cur);
+      return;
+    }
     const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
     for (const ev of events.length ? events : [e]) {
       const [x, y] = pos(ev);
@@ -492,41 +673,75 @@ function makeBoard() {
       drawSeg(ctx, [cur.c, cur.w, lx, ly, x, y]);
     }
   });
-  const end = () => { cur = null; };
-  canvas.addEventListener('pointerup', end);
-  canvas.addEventListener('pointercancel', end);
-  canvas.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') end(); });
 
+  const finish = (e) => {
+    if (!cur) return;
+    if (cur.t === 'shape') {
+      octx.clearRect(0, 0, W, H);
+      const a = cur.a;
+      if (e.type === 'pointerup' && Math.abs(a[2] - a[0]) + Math.abs(a[3] - a[1]) >= 6) {
+        remember();
+        ops.push(cur);
+        drawShape(ctx, cur);
+      }
+    }
+    cur = null;
+  };
+  canvas.addEventListener('pointerup', finish);
+  canvas.addEventListener('pointercancel', finish);
+
+  // --- Werkzeugleiste ---
+  const toolBtns = TOOLS.map(([id, icon, label]) => {
+    const b = h('button', { class: 'toolbtn', 'aria-label': label, title: label, onclick: () => { tool = id; sync(); } }, icon);
+    b.dataset.t = id;
+    return b;
+  });
+  const fillBtn = h('button', { class: 'ghost small', onclick: () => { filled = !filled; sync(); } }, '');
   const swatches = COLORS.map((c) => {
-    const b = h('button', { class: 'swatch', style: `background:${c}`, 'aria-label': 'Farbe ' + c, onclick: () => { color = c; eraser = false; sync(); } });
+    const b = h('button', { class: 'swatch', style: `background:${c}`, 'aria-label': 'Farbe ' + c, onclick: () => { color = c; if (tool === 'eraser') tool = 'pen'; sync(); } });
     b.dataset.c = c;
     return b;
   });
-  const sizeBtns = SIZES.map((s) => {
-    const b = h('button', { class: 'sizebtn', 'aria-label': 'Strichstärke', onclick: () => { size = s; sync(); } }, h('span', { style: `width:${Math.max(5, s * 0.8)}px;height:${Math.max(5, s * 0.8)}px` }));
-    b.dataset.s = s;
+  const sizeBtns = SIZES.map((sz) => {
+    const b = h('button', { class: 'sizebtn', 'aria-label': 'Strichstärke', onclick: () => { size = sz; sync(); } },
+      h('span', { style: `width:${Math.max(5, sz * 0.8)}px;height:${Math.max(5, sz * 0.8)}px` }));
+    b.dataset.s = sz;
     return b;
   });
-  const eraserBtn = h('button', { class: 'ghost toolbtn small', onclick: () => { eraser = !eraser; sync(); } }, '🧽 Radierer');
-  const undoBtn = h('button', { class: 'ghost small', onclick: () => { strokes.pop(); redraw(); } }, '↩️ Zurück');
-  const clearBtn = h('button', { class: 'ghost small', onclick: () => { if (strokes.length && confirm('Alles löschen?')) { strokes.length = 0; redraw(); } } }, '🗑️ Leeren');
+  const undoBtn = h('button', { class: 'ghost small', onclick: () => {
+    const snap = history.pop();
+    if (!snap) return;
+    base = snap.base;
+    ops = snap.ops;
+    redraw();
+  } }, '↩️ Zurück');
+  const clearBtn = h('button', { class: 'ghost small', onclick: () => {
+    if (!base.length && !ops.length) return;
+    remember(); // „Zurück“ macht das Löschen rückgängig
+    base = [];
+    ops = [];
+    redraw();
+  } }, base.length ? '🗑️ Alles löschen' : '🗑️ Leeren');
 
   function sync() {
-    swatches.forEach((b) => b.classList.toggle('sel', !eraser && b.dataset.c === color));
+    toolBtns.forEach((b) => b.classList.toggle('sel', b.dataset.t === tool));
+    swatches.forEach((b) => b.classList.toggle('sel', tool !== 'eraser' && b.dataset.c === color));
     sizeBtns.forEach((b) => b.classList.toggle('sel', Number(b.dataset.s) === size));
-    eraserBtn.classList.toggle('sel', eraser);
+    fillBtn.hidden = !['rect', 'ellipse', 'triangle'].includes(tool);
+    fillBtn.textContent = filled ? '■ Gefüllt' : '□ Nur Umriss';
+    canvas.style.cursor = tool === 'fill' ? 'cell' : 'crosshair';
   }
   sync();
 
   const toolbar = h('div', { class: 'toolbar' },
+    h('div', { class: 'tools' }, toolBtns, fillBtn),
     h('div', { class: 'swatches' }, swatches),
-    h('div', { class: 'row', style: 'gap:6px' }, sizeBtns),
-    h('div', { class: 'row', style: 'gap:6px' }, eraserBtn, undoBtn, clearBtn));
+    h('div', { class: 'row', style: 'gap:6px' }, sizeBtns, undoBtn, clearBtn));
 
   return {
-    el: h('div', {}, canvas, toolbar),
-    strokes,
-    lock(l) { locked = l; toolbar.hidden = l; if (l) cur = null; },
+    el: h('div', {}, wrap, toolbar),
+    getOps: () => ({ strokes: base.concat(ops), from: base.length }),
+    lock(l) { locked = l; toolbar.hidden = l; if (l) { cur = null; octx.clearRect(0, 0, W, H); } },
   };
 }
 
@@ -543,12 +758,19 @@ function renderReveal() {
   const token = `${rv.chain}:${rv.step}`;
   S.revealToken = token;
 
+  const anim = v.mode === 'animation';
+  const lastStep = chain.entries.length - 1;
+  // Animationsmodus: nach dem letzten Bild läuft die ganze Kette als Mini-Film
+  const frames = anim ? chain.entries.filter((e) => e.type === 'drawing') : [];
+  const fb = anim && rv.step === lastStep && frames.length ? makeFlipbook(frames) : null;
+  const fbCard = fb ? h('div', { class: 'entry', hidden: true }, h('div', { class: 'ehead' }, '🎞️ Als Mini-Film:'), fb.el) : null;
+
   const cards = [];
   let lastCard = null;
   for (let i = 0; i <= rv.step; i++) {
     const e = chain.entries[i];
     const animate = i === rv.step;
-    const verb = i === 0 ? 'schrieb' : e.type === 'drawing' ? 'zeichnete' : 'beschrieb';
+    const verb = i === 0 ? (anim ? 'hatte die Idee' : 'schrieb') : e.type === 'drawing' ? (anim ? `zeichnete Bild ${i}` : 'zeichnete') : 'beschrieb';
     const content = e.type === 'text' ? textBubble(e) : makeCanvas('rcanvas');
     const card = h('div', { class: 'entry' }, h('div', { class: 'ehead' }, avatar(e.author), `${e.author} ${verb}:`), content);
     cards.push(card);
@@ -556,20 +778,26 @@ function renderReveal() {
 
     const done = () => {
       if (S.revealToken !== token) return;
-      if (host && S.view.reveal.auto) later(() => { if (S.revealToken === token) act('reveal', { action: 'next' }).catch(() => {}); }, 2200);
+      if (fb) {
+        fbCard.hidden = false;
+        fb.start();
+        fbCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      if (host && S.view.reveal.auto) later(() => { if (S.revealToken === token) act('reveal', { action: 'next' }).catch(() => {}); }, fb ? 8000 : 2200);
     };
     if (e.type === 'text') {
       if (animate && !e.missing) typewriter(content, e.text, done);
       else if (animate) later(done, 1200);
       else if (!e.missing) content.textContent = e.text;
     } else if (animate) {
-      S.cancelAnim = animateStrokes(content, e.strokes, done);
+      S.cancelAnim = animateStrokes(content, e.strokes, e.from || 0, done);
     } else {
       drawStatic(content, e.strokes);
     }
   }
+  if (fbCard) cards.push(fbCard);
 
-  const isLast = rv.chain === v.chains.length - 1 && rv.step === chain.entries.length - 1;
+  const isLast = rv.chain === v.chains.length - 1 && rv.step === lastStep;
   const controls = host
     ? h('div', { class: 'controls' }, h('div', { class: 'inner' },
         h('button', { class: 'ghost', onclick: () => ctl('prev') }, '◀'),
@@ -600,16 +828,25 @@ function ctl(action) {
 function renderFinished() {
   const v = S.view;
   const host = isHost();
-  const sections = v.chains.map((c) =>
-    h('div', { class: 'card chain-summary' },
+  const anim = v.mode === 'animation';
+  const sections = v.chains.map((c) => {
+    const frames = anim ? c.entries.filter((e) => e.type === 'drawing') : [];
+    let film = null;
+    if (frames.length) {
+      const fb = makeFlipbook(frames);
+      fb.start();
+      film = h('div', {}, h('div', { class: 'ehead' }, '🎞️ Mini-Film'), fb.el);
+    }
+    return h('div', { class: 'card chain-summary' },
       h('h3', {}, `Kette von ${c.owner}`),
-      h('div', { class: 'strip' }, c.entries.map((e, i) => {
-        const verb = i === 0 ? 'schrieb' : e.type === 'drawing' ? 'zeichnete' : 'beschrieb';
+      h('div', { class: 'strip' }, film, c.entries.map((e, i) => {
+        const verb = i === 0 ? (anim ? 'hatte die Idee' : 'schrieb') : e.type === 'drawing' ? (anim ? `zeichnete Bild ${i}` : 'zeichnete') : 'beschrieb';
         let content;
         if (e.type === 'text') content = h('div', { class: 'bubble' + (e.missing ? ' empty' : '') }, e.missing ? '(nichts geschrieben)' : e.text);
         else { content = makeCanvas('rcanvas'); drawStatic(content, e.strokes); }
         return h('div', {}, h('div', { class: 'ehead' }, avatar(e.author), `${e.author} ${verb}`), content);
-      }))));
+      })));
+  });
 
   setView(
     h('div', { class: 'hero' }, h('div', { class: 'logo' }, '🎉'), h('h1', {}, 'Das war’s!'), h('p', {}, 'Alle Ketten auf einen Blick.')),

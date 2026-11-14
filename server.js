@@ -93,33 +93,53 @@ function cleanText(raw) {
   return String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 140);
 }
 
+const SHAPE_KINDS = ['line', 'rect', 'ellipse', 'triangle'];
+const MAX_OPS = 5000;
+const MAX_POINTS = 60000;
+
+// Eine Zeichnung ist eine Liste von Operationen: Stiftstriche {c,w,p}, Füllungen {t:'fill'}, Formen {t:'shape'}.
 function cleanStrokes(arr) {
   if (!Array.isArray(arr)) return [];
   const out = [];
   let points = 0;
-  for (const s of arr.slice(0, 2500)) {
-    if (!s || !Array.isArray(s.p)) continue;
+  for (const s of arr.slice(0, MAX_OPS)) {
+    if (!s || typeof s !== 'object') continue;
     const c = typeof s.c === 'string' && /^#[0-9a-f]{6}$/i.test(s.c) ? s.c.toLowerCase() : '#000000';
-    const w = clamp(Math.round(Number(s.w) || 6), 1, 60);
+    if (s.t === 'fill') {
+      out.push({ t: 'fill', c, x: clamp(Math.round(Number(s.x) || 0), 0, CANVAS_W - 1), y: clamp(Math.round(Number(s.y) || 0), 0, CANVAS_H - 1) });
+      continue;
+    }
+    if (s.t === 'shape') {
+      if (!SHAPE_KINDS.includes(s.k) || !Array.isArray(s.a) || s.a.length < 4) continue;
+      out.push({
+        t: 'shape',
+        k: s.k,
+        c,
+        w: clamp(Math.round(Number(s.w) || 6), 1, 60),
+        f: s.k !== 'line' && !!s.f,
+        a: [0, 1, 2, 3].map((i) => clamp(Math.round(Number(s.a[i]) || 0), 0, i % 2 ? CANVAS_H : CANVAS_W)),
+      });
+      continue;
+    }
+    if (!Array.isArray(s.p)) continue;
+    const w = clamp(Math.round(Number(s.w) || 6), 1, 150);
     const p = [];
-    for (let i = 0; i + 1 < s.p.length && points < 40000; i += 2) {
-      p.push(
-        clamp(Math.round(Number(s.p[i]) || 0), 0, CANVAS_W),
-        clamp(Math.round(Number(s.p[i + 1]) || 0), 0, CANVAS_H)
-      );
+    for (let i = 0; i + 1 < s.p.length && points < MAX_POINTS; i += 2) {
+      p.push(clamp(Math.round(Number(s.p[i]) || 0), 0, CANVAS_W), clamp(Math.round(Number(s.p[i + 1]) || 0), 0, CANVAS_H));
       points++;
     }
     if (p.length) out.push({ c, w, p });
-    if (points >= 40000) break;
+    if (points >= MAX_POINTS) break;
   }
   return out;
 }
 
-const DEFAULT_SETTINGS = { firstTime: 60, writeTime: 45, drawTime: 90 };
+const DEFAULT_SETTINGS = { mode: 'normal', firstTime: 60, writeTime: 45, drawTime: 90 };
 
 function cleanSettings(raw, current) {
   const s = { ...current };
   if (raw && typeof raw === 'object') {
+    if (raw.mode === 'normal' || raw.mode === 'animation') s.mode = raw.mode;
     if (raw.firstTime !== undefined) s.firstTime = clamp(Math.round(Number(raw.firstTime) || current.firstTime), 15, 300);
     if (raw.writeTime !== undefined) s.writeTime = clamp(Math.round(Number(raw.writeTime) || current.writeTime), 15, 300);
     if (raw.drawTime !== undefined) s.drawTime = clamp(Math.round(Number(raw.drawTime) || current.drawTime), 15, 600);
@@ -155,7 +175,8 @@ function makePlayer(name) {
   return { id: newId(), name, streams: new Set() };
 }
 
-const kindOf = (r) => (r === 0 ? 'write' : r % 2 === 1 ? 'draw' : 'describe');
+// Normal: schreiben, zeichnen, beschreiben, ... | Animation: Idee schreiben, danach nur noch Bilder zeichnen
+const kindOf = (r, mode) => (r === 0 ? 'write' : mode === 'animation' ? 'draw' : r % 2 === 1 ? 'draw' : 'describe');
 
 function publicPlayer(room, p) {
   return { id: p.id, name: p.name, connected: p.streams.size > 0, host: p.id === room.hostId };
@@ -177,15 +198,20 @@ function viewFor(room, pid) {
     const r = room.round;
     view.round = r;
     view.total = N;
-    view.kind = kindOf(r);
+    view.kind = kindOf(r, room.settings.mode);
+    view.mode = room.settings.mode;
     view.deadline = room.deadline;
     view.submitted = room.pending.has(pid);
     view.submittedCount = room.pending.size;
     if (j >= 0 && r > 0) {
-      const e = room.chains[(j + r) % N].entries[r - 1];
+      const chain = room.chains[(j + r) % N];
+      const e = chain.entries[r - 1];
       view.input = { type: e.type, text: e.text, strokes: e.strokes, missing: !!e.missing, author: e.author };
+      // Animation: die Idee (erster Eintrag der Kette) bleibt in jeder Runde sichtbar
+      if (room.settings.mode === 'animation') view.idea = chain.entries[0].text;
     }
   } else if (room.state === 'reveal') {
+    view.mode = room.settings.mode;
     view.total = room.order.length;
     view.chains = room.chains.map((c) => ({ owner: c.ownerName, entries: c.entries }));
     view.reveal = room.reveal;
@@ -225,7 +251,7 @@ function startGame(room) {
 }
 
 function roundSeconds(room, r) {
-  const k = kindOf(r);
+  const k = kindOf(r, room.settings.mode);
   return k === 'write' ? room.settings.firstTime : k === 'draw' ? room.settings.drawTime : room.settings.writeTime;
 }
 
@@ -243,14 +269,24 @@ function endRound(room, r) {
   if (room.state !== 'play' || room.round !== r) return;
   clearTimeout(room.timer);
   const N = room.order.length;
-  const kind = kindOf(r);
+  const kind = kindOf(r, room.settings.mode);
   room.order.forEach((pid, j) => {
     const player = room.players.find((p) => p.id === pid);
     let entry = room.pending.get(pid);
+    const chain = room.chains[(j + r) % N];
     if (!entry) {
-      entry = kind === 'draw' ? { type: 'drawing', strokes: [], missing: true } : { type: 'text', text: '', missing: true };
+      if (kind === 'draw') {
+        // Animation: ein verpasstes Bild übernimmt einfach das vorherige, damit die Kette nicht abreißt
+        const prev = room.settings.mode === 'animation' && r >= 2 ? chain.entries[r - 1] : null;
+        entry =
+          prev && prev.type === 'drawing'
+            ? { type: 'drawing', strokes: prev.strokes, from: prev.strokes.length, missing: true }
+            : { type: 'drawing', strokes: [], from: 0, missing: true };
+      } else {
+        entry = { type: 'text', text: '', missing: true };
+      }
     }
-    room.chains[(j + r) % N].entries.push({ author: player.name, ...entry });
+    chain.entries.push({ author: player.name, ...entry });
   });
   if (r + 1 >= N) {
     room.state = 'reveal';
@@ -379,12 +415,14 @@ async function handleApi(req, res, url) {
       if (Number(body.round) !== room.round) throw fail(409, 'Diese Runde ist schon vorbei');
       if (!room.order.includes(player.id)) throw fail(403, 'Du spielst in dieser Runde nicht mit');
       if (room.pending.has(player.id)) return sendJson(res, 200, { ok: true });
-      const kind = kindOf(room.round);
+      const kind = kindOf(room.round, room.settings.mode);
       const entry =
         kind === 'draw'
           ? (() => {
               const strokes = cleanStrokes(body.strokes);
-              return { type: 'drawing', strokes, missing: strokes.length === 0 };
+              // from = Anzahl der Operationen, die vom Vorgängerbild übernommen wurden (nur Animationsmodus)
+              const from = room.settings.mode === 'animation' ? clamp(Math.round(Number(body.from) || 0), 0, strokes.length) : 0;
+              return { type: 'drawing', strokes, from, missing: strokes.length === 0 };
             })()
           : (() => {
               const text = cleanText(body.text);
