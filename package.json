@@ -1,0 +1,12 @@
+{
+  "name": "kritzelphone",
+  "version": "1.0.0",
+  "description": "Gartic-Phone-Klon für Freunde: schreiben, zeichnen, beschreiben – mit animierter Auflösung.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/bots.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
